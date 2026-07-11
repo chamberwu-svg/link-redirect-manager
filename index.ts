@@ -228,7 +228,8 @@ const COUNTRY_NAME_BY_CODE = Object.fromEntries(COUNTRY_OPTIONS.map((item) => [i
 export {};
 
 const PORT = Number(Bun.env.PORT || 8000);
-const HAS_DATABASE_URL = Boolean(Bun.env.DATABASE_URL);
+const DATABASE_URL = (Bun.env.DATABASE_URL || "").trim();
+const HAS_DATABASE_URL = Boolean(DATABASE_URL);
 const CLOUDFLARE_API_TOKEN = Bun.env.CLOUDFLARE_API_TOKEN || "";
 const CLOUDFLARE_API_BASE = Bun.env.CLOUDFLARE_API_BASE || "https://api.cloudflare.com/client/v4";
 const CLOUDFLARE_ZONE_ID = Bun.env.CLOUDFLARE_ZONE_ID || "";
@@ -238,6 +239,8 @@ const CLOUDFLARE_TOKEN_CONFIGURED = Boolean(CLOUDFLARE_API_TOKEN);
 const CLOUDFLARE_AUTO_DNS_ENABLED = Boolean(CLOUDFLARE_API_TOKEN && CLOUDFLARE_DNS_TARGET);
 const CLOUDFLARE_ZONE_CACHE = new Map<string, string>();
 const COUNTRY_BY_IP_CACHE = new Map<string, { code: string; expiresAt: number }>();
+let DATABASE_CONNECTION_READY = false;
+let DATABASE_CONNECTION_ERROR: string | null = null;
 const COUNTRY_CACHE_TTL_MS = 10 * 60 * 1000;
 const RAILWAY_TOKEN = Bun.env.RAILWAY_TOKEN || "";
 const RAILWAY_PROJECT_ID = Bun.env.RAILWAY_PROJECT_ID || "";
@@ -436,9 +439,14 @@ function getCountryDisplayName(code: string): string {
   return COUNTRY_NAME_BY_CODE[normalizedCode as keyof typeof COUNTRY_NAME_BY_CODE] || normalizedCode;
 }
 
+function isDatabaseOperational(): boolean {
+  return HAS_DATABASE_URL && DATABASE_CONNECTION_READY;
+}
+
 async function initDB() {
-  const dbUrl = Bun.env.DATABASE_URL;
-  if (!dbUrl) {
+  if (!HAS_DATABASE_URL) {
+    DATABASE_CONNECTION_READY = false;
+    DATABASE_CONNECTION_ERROR = "DATABASE_URL not set";
     console.error("DATABASE_URL not set");
     return;
   }
@@ -446,6 +454,8 @@ async function initDB() {
   const sql = Bun.sql;
 
   try {
+    await sql`SELECT 1`;
+
     await sql`
       CREATE TABLE IF NOT EXISTS domains (
         id SERIAL PRIMARY KEY,
@@ -537,8 +547,12 @@ async function initDB() {
       )
     `;
 
+    DATABASE_CONNECTION_READY = true;
+    DATABASE_CONNECTION_ERROR = null;
     console.log("Database initialized successfully");
   } catch (error) {
+    DATABASE_CONNECTION_READY = false;
+    DATABASE_CONNECTION_ERROR = error instanceof Error ? error.message : String(error);
     console.error("Database initialization error:", error);
   }
 }
@@ -2960,7 +2974,7 @@ async function handleRedirect(
 }
 
 async function tryDomainHostRedirect(path: string, req: Request, sql: SqlClient): Promise<Response | null> {
-  if (!HAS_DATABASE_URL) {
+  if (!isDatabaseOperational()) {
     return null;
   }
 
@@ -3011,7 +3025,19 @@ async function handleRequest(req: Request): Promise<Response> {
         ok: true,
         version: APP_VERSION,
         databaseConfigured: HAS_DATABASE_URL,
+        databaseReady: isDatabaseOperational(),
       });
+    }
+
+    const requiresDatabase = path.startsWith("/api/") && !["/api/version", "/api/railway/status", "/api/cloudflare/token/status"].includes(path);
+    if (requiresDatabase && !isDatabaseOperational()) {
+      return jsonResponse(
+        {
+          error: "Database unavailable",
+          detail: DATABASE_CONNECTION_ERROR || "Database connection is not ready",
+        },
+        503
+      );
     }
 
     const hostRedirect = await tryDomainHostRedirect(path, req, sql);

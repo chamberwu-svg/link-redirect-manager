@@ -59,7 +59,7 @@ export DATABASE_URL="postgres://user:password@localhost:5432/link_redirect_manag
 bun run dev
 ```
 
-启动后访问 http://localhost:3000/admin 进入管理面板。
+启动后访问 http://localhost:8000/admin 进入管理面板。
 
 ## 主要接口
 
