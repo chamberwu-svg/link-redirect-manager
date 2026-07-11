@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: link-redirect-manager
+    runtime: docker
+    plan: free
+    autoDeploy: true
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: NODE_ENV
+        value: production
