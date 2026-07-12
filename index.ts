@@ -62,6 +62,9 @@ const COUNTRY_OPTIONS = [
   { code: "TD", name: "乍得" },
   { code: "CL", name: "智利" },
   { code: "CN", name: "中国" },
+  { code: "HK", name: "香港" },
+  { code: "MO", name: "澳门" },
+  { code: "TW", name: "台湾" },
   { code: "CO", name: "哥伦比亚" },
   { code: "KM", name: "科摩罗" },
   { code: "CG", name: "刚果（布）" },
@@ -806,6 +809,33 @@ async function bindRailwayCustomDomain(domainName: string): Promise<{ bound: boo
 type CloudflareZone = { id: string; name: string };
 type CloudflareZonesResponse = { result: CloudflareZone[] };
 
+function getCloudflareZoneLookupCandidates(domainName: string): string[] {
+  const normalizedDomain = normalizeDomainInput(domainName);
+  if (!normalizedDomain) {
+    return [];
+  }
+
+  const labels = normalizedDomain.split(".");
+  const candidates: string[] = [];
+
+  for (let index = 0; index < labels.length - 1; index += 1) {
+    candidates.push(labels.slice(index).join("."));
+  }
+
+  return [...new Set(candidates)];
+}
+
+function isCompatibleCloudflareZone(domainName: string, zoneName: string): boolean {
+  const normalizedDomain = normalizeDomainInput(domainName);
+  const normalizedZone = normalizeDomainInput(zoneName);
+
+  if (!normalizedDomain || !normalizedZone) {
+    return false;
+  }
+
+  return normalizedDomain === normalizedZone || normalizedDomain.endsWith(`.${normalizedZone}`);
+}
+
 async function resolveCloudflareZoneId(domainName: string): Promise<string> {
   const normalizedDomain = normalizeDomainInput(domainName);
   if (!normalizedDomain) {
@@ -817,13 +847,15 @@ async function resolveCloudflareZoneId(domainName: string): Promise<string> {
     return cachedZoneId;
   }
 
+  const lookupCandidates = getCloudflareZoneLookupCandidates(normalizedDomain);
+
   if (CLOUDFLARE_ZONE_ID) {
     const zone = await cloudflareApiRequest<{ result: CloudflareZone }>(
       `/zones/${encodeURIComponent(CLOUDFLARE_ZONE_ID)}`
     );
     const zoneName = normalizeDomainInput(zone.result?.name || "");
 
-    if (zoneName !== normalizedDomain) {
+    if (!isCompatibleCloudflareZone(normalizedDomain, zoneName)) {
       throw new Error(
         `Configured CLOUDFLARE_ZONE_ID belongs to ${zone.result?.name || "unknown"}, not ${normalizedDomain}. Remove CLOUDFLARE_ZONE_ID to auto-discover zones per domain.`
       );
@@ -833,17 +865,19 @@ async function resolveCloudflareZoneId(domainName: string): Promise<string> {
     return zone.result.id;
   }
 
-  const response = await cloudflareApiRequest<CloudflareZonesResponse>(
-    `/zones?name=${encodeURIComponent(normalizedDomain)}&status=active&per_page=1`
-  );
+  for (const candidate of lookupCandidates) {
+    const response = await cloudflareApiRequest<CloudflareZonesResponse>(
+      `/zones?name=${encodeURIComponent(candidate)}&status=active&per_page=1`
+    );
 
-  const zoneId = response.result?.[0]?.id;
-  if (!zoneId) {
-    throw new Error(`No active Cloudflare zone found for ${normalizedDomain}`);
+    const zoneId = response.result?.[0]?.id;
+    if (zoneId) {
+      CLOUDFLARE_ZONE_CACHE.set(normalizedDomain, zoneId);
+      return zoneId;
+    }
   }
 
-  CLOUDFLARE_ZONE_CACHE.set(normalizedDomain, zoneId);
-  return zoneId;
+  throw new Error(`No active Cloudflare zone found for ${normalizedDomain}`);
 }
 
 async function syncCloudflareCnameRecord(domainName: string): Promise<{ synced: boolean; message: string }> {
@@ -857,11 +891,18 @@ async function syncCloudflareCnameRecord(domainName: string): Promise<{ synced: 
   type CloudflareDnsRecord = { id: string; type: string };
   type CloudflareListResponse = { result: CloudflareDnsRecord[] };
   const zoneId = await resolveCloudflareZoneId(domainName);
+  const zone = await cloudflareApiRequest<{ result: CloudflareZone }>(
+    `/zones/${encodeURIComponent(zoneId)}`
+  );
+  const zoneName = normalizeDomainInput(zone.result?.name || "");
+  const recordName = normalizeDomainInput(domainName) === zoneName
+    ? "@"
+    : normalizeDomainInput(domainName).slice(0, normalizeDomainInput(domainName).length - zoneName.length - 1);
 
   const syncableTypes = new Set(["A", "AAAA", "CNAME"]);
   const body = JSON.stringify({
     type: "CNAME",
-    name: domainName,
+    name: recordName,
     content: CLOUDFLARE_DNS_TARGET,
     proxied: CLOUDFLARE_DNS_PROXIED,
     ttl: 1,
