@@ -15,7 +15,7 @@
 - Bun
 - PostgreSQL
 - DATABASE_URL 环境变量
-- Cloudflare API Token、CLOUDFLARE_DNS_TARGET（创建入口域名时必须配置，用于自动同步 Cloudflare DNS）
+- Cloudflare / Railway 二选一或同时配置（用于自动绑定入口域名，可选）
 - 管理后台使用 Basic Auth（用户名 + 密码）
 - 内置账号：
 	- admin（密码来自 `ADMIN_PASSWORD`，默认 `xiaozhangnb`）
@@ -42,12 +42,18 @@ Railway 自定义域名自动绑定相关环境变量（推荐配置）：
 当配置 `CLOUDFLARE_API_TOKEN` 和 `CLOUDFLARE_DNS_TARGET` 时：
 
 - 创建入口域名会自动按域名名称查找对应的 Cloudflare Zone，并创建或更新 CNAME 记录
-- 若 DNS 同步失败，会回滚刚创建的入口域名，避免数据不一致
 
 当同时配置 Railway 变量时：
 
 - 创建入口域名会先调用 Railway GraphQL API 绑定自定义域名，再同步 Cloudflare DNS
-- 若 Railway 绑定失败，会回滚刚创建的入口域名
+
+创建入口域名时支持 `provision_channel`（可在管理面板选择）：
+
+- `auto`（默认）：按已配置项自动尝试 Railway/Cloudflare，任一失败不会回滚域名记录
+- `cloudflare`：仅走 Cloudflare，失败会回滚新建域名
+- `railway`：仅走 Railway，失败会回滚新建域名
+- `both`：Railway + Cloudflare 都必须成功，任一失败会回滚新建域名
+- `manual`：只创建系统记录，不做自动绑定
 
 ## 快速开始
 
@@ -91,6 +97,15 @@ bun run dev
 2. 给 `example.com` 配置多个子链接
 3. 将 DNS 指向部署地址（A/CNAME 到你的服务）
 4. 用户访问 `https://example.com` 时，会按 IP 锁定规则跳转到对应子链接
+
+`POST /api/domains` 请求体示例：
+
+```json
+{
+	"domain_name": "go.example.com",
+	"provision_channel": "auto"
+}
+```
 
 ## 部署到 Railway
 

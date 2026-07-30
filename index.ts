@@ -806,6 +806,23 @@ async function bindRailwayCustomDomain(domainName: string): Promise<{ bound: boo
   return { bound: true, message: "Railway custom domain bound" };
 }
 
+type ProvisionChannel = "auto" | "cloudflare" | "railway" | "both" | "manual";
+
+function normalizeProvisionChannel(rawChannel: string): ProvisionChannel {
+  const normalized = String(rawChannel || "").trim().toLowerCase();
+
+  if (
+    normalized === "cloudflare" ||
+    normalized === "railway" ||
+    normalized === "both" ||
+    normalized === "manual"
+  ) {
+    return normalized;
+  }
+
+  return "auto";
+}
+
 type CloudflareZone = { id: string; name: string };
 type CloudflareZonesResponse = { result: CloudflareZone[] };
 
@@ -1445,10 +1462,20 @@ function getAdminHTML(currentUsername: string): string {
           <div class="toolbar">
             <h2>新建子链接入口域名</h2>
           </div>
-          <p>用于子链接跳转的统一入口域名。用户访问该域名时直接进入分配逻辑，不展示前端首页。创建前会校验 Cloudflare API Token。</p>
+          <p>用于子链接跳转的统一入口域名。用户访问该域名时直接进入分配逻辑，不展示前端首页。创建时可选 Cloudflare、Railway 或双通道自动绑定。</p>
           <div class="field">
             <label for="domain-name">子链接入口域名</label>
             <input id="domain-name" placeholder="go.example.com">
+          </div>
+          <div class="field">
+            <label for="provision-channel">入口绑定通道</label>
+            <select id="provision-channel">
+              <option value="auto" selected>自动（可用通道都尝试）</option>
+              <option value="both">双通道（Cloudflare + Railway，都必须成功）</option>
+              <option value="cloudflare">仅 Cloudflare</option>
+              <option value="railway">仅 Railway</option>
+              <option value="manual">手动（只建记录，不自动绑定）</option>
+            </select>
           </div>
           <button class="btn-primary" id="create-domain-btn">创建子链接入口</button>
           <div id="domain-message" class="message"></div>
@@ -2235,7 +2262,9 @@ function getAdminHTML(currentUsername: string): string {
 
     document.getElementById('create-domain-btn').addEventListener('click', async () => {
       const input = document.getElementById('domain-name');
+      const channelInput = document.getElementById('provision-channel');
       const domainName = input.value.trim();
+      const provisionChannel = channelInput ? channelInput.value : 'auto';
       if (!domainName) {
         setMessage('domain-message', '请输入子链接入口域名', 'error');
         return;
@@ -2244,16 +2273,19 @@ function getAdminHTML(currentUsername: string): string {
       try {
         const domain = await api('/api/domains', {
           method: 'POST',
-          body: JSON.stringify({ domain_name: domainName })
+          body: JSON.stringify({ domain_name: domainName, provision_channel: provisionChannel })
         });
         input.value = '';
         state.selectedDomainId = domain.id;
         state.selectedDomainName = domain.domain_name;
         const railwaySuffix = domain.railway_message ? ('，' + domain.railway_message) : '';
         const dnsSuffix = domain.dns_message ? ('，' + domain.dns_message) : '';
+        const warnSuffix = Array.isArray(domain.provision_errors) && domain.provision_errors.length
+          ? ('，警告：' + domain.provision_errors.join('；'))
+          : '';
         const createLabel = domain.created ? '子链接入口已创建' : '子链接入口已同步';
-        const isSuccess = domain.railway_bound && domain.dns_synced;
-        setMessage('domain-message', createLabel + railwaySuffix + dnsSuffix, isSuccess ? 'success' : '');
+        const isSuccess = Boolean(domain.provision_ok);
+        setMessage('domain-message', createLabel + railwaySuffix + dnsSuffix + warnSuffix, isSuccess ? 'success' : 'error');
         await loadOverview();
       } catch (error) {
         setMessage('domain-message', error.message, 'error');
@@ -2490,21 +2522,12 @@ async function handleOverview(sql: SqlClient, ownerUsername: string): Promise<Re
 }
 
 async function handleCreateDomain(req: Request, sql: SqlClient, ownerUsername: string): Promise<Response> {
-  const body = await parseJsonBody<{ domain_name?: string }>(req);
+  const body = await parseJsonBody<{ domain_name?: string; provision_channel?: string; channel?: string }>(req);
   const domainName = normalizeDomainInput(body.domain_name || "");
+  const provisionChannel = normalizeProvisionChannel(body.provision_channel || body.channel || "auto");
 
   if (!domainName) {
     return jsonResponse({ error: "domain_name is required" }, 400);
-  }
-
-  if (!CLOUDFLARE_AUTO_DNS_ENABLED) {
-    return jsonResponse(
-      {
-        error:
-          "Cloudflare DNS sync is not configured. Set CLOUDFLARE_API_TOKEN and CLOUDFLARE_DNS_TARGET first.",
-      },
-      400
-    );
   }
 
   const result = await sql`
@@ -2536,29 +2559,78 @@ async function handleCreateDomain(req: Request, sql: SqlClient, ownerUsername: s
   let dnsMessage = "Auto DNS disabled";
   let railwayBound = false;
   let railwayMessage = "Railway binding disabled";
+  const provisionErrors: string[] = [];
+
+  const shouldUseCloudflare = provisionChannel === "auto" || provisionChannel === "cloudflare" || provisionChannel === "both";
+  const shouldUseRailway = provisionChannel === "auto" || provisionChannel === "railway" || provisionChannel === "both";
+  const strictProvision = provisionChannel === "cloudflare" || provisionChannel === "railway" || provisionChannel === "both";
 
   try {
-    const railwayResult = await bindRailwayCustomDomain(domainName);
-    railwayBound = railwayResult.bound;
-    railwayMessage = railwayResult.message;
+    if (shouldUseRailway) {
+      if (!RAILWAY_CONFIGURED) {
+        railwayMessage = "Railway binding skipped (missing RAILWAY_TOKEN or project/environment/service IDs)";
+        if (strictProvision) {
+          provisionErrors.push("Railway not configured");
+        }
+      } else {
+        try {
+          const railwayResult = await bindRailwayCustomDomain(domainName);
+          railwayBound = railwayResult.bound;
+          railwayMessage = railwayResult.message;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "Railway binding failed";
+          railwayMessage = message;
+          provisionErrors.push(`Railway: ${message}`);
+        }
+      }
+    }
 
-    const dnsResult = await syncCloudflareCnameRecord(domainName);
-    dnsSynced = dnsResult.synced;
-    dnsMessage = dnsResult.message;
+    if (shouldUseCloudflare) {
+      if (!CLOUDFLARE_AUTO_DNS_ENABLED) {
+        dnsMessage = "Cloudflare DNS sync skipped (missing CLOUDFLARE_API_TOKEN or CLOUDFLARE_DNS_TARGET)";
+        if (strictProvision) {
+          provisionErrors.push("Cloudflare not configured");
+        }
+      } else {
+        try {
+          const dnsResult = await syncCloudflareCnameRecord(domainName);
+          dnsSynced = dnsResult.synced;
+          dnsMessage = dnsResult.message;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "Cloudflare DNS sync failed";
+          dnsMessage = message;
+          provisionErrors.push(`Cloudflare: ${message}`);
+        }
+      }
+    }
   } catch (error) {
+    const message = error instanceof Error ? error.message : "Domain provisioning failed";
+    provisionErrors.push(message);
+  }
+
+  const successCount = Number(railwayBound) + Number(dnsSynced);
+  const configuredSelectedCount =
+    Number(shouldUseRailway && RAILWAY_CONFIGURED) + Number(shouldUseCloudflare && CLOUDFLARE_AUTO_DNS_ENABLED);
+  const provisionOk = strictProvision
+    ? provisionErrors.length === 0
+    : configuredSelectedCount === 0 || successCount > 0;
+  if (!provisionOk && strictProvision) {
     if (created && domainRow) {
       await sql`
         DELETE FROM domains WHERE id = ${domainRow.id}
       `;
     }
 
-    const message = error instanceof Error ? error.message : "Cloudflare DNS sync failed";
-    return jsonResponse({ error: `Domain creation rolled back: ${message}` }, 502);
+    const errorMessage = `Domain creation rolled back: ${provisionErrors.join("; ")}`;
+    return jsonResponse({ error: errorMessage }, 502);
   }
 
   return jsonResponse({
     ...domainRow,
     created,
+    provision_channel: provisionChannel,
+    provision_ok: provisionOk,
+    provision_errors: provisionErrors,
     railway_bound: railwayBound,
     railway_message: railwayMessage,
     dns_synced: dnsSynced,
